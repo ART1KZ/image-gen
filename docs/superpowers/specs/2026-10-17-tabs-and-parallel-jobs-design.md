@@ -142,3 +142,15 @@ controls, singleton startup and abrupt-crash cleanup on Windows; verify current
 ChatGPT stop controls and behavior under concurrent requests; preserve a stable
 API for transparency reports and existing MCP configurations. ChatGPT's account
 limits remain external constraints and must be surfaced as job errors.
+
+# User-requested headless amendment
+
+Generation launches a separate headless Microsoft Edge by default with the saved
+ChatGPT storage state and login User-Agent. The visible dedicated auth browser
+is used only for login, and can be closed after session saving. The worker never
+opens a login window automatically. Missing/expired login directs the user to
+the explicit login command. A refreshed session is applied between active jobs
+without replacing worker tabs. IMAGE_GEN_HEADLESS=0 retains visible CDP mode for
+debugging; the setting applies when the coordinator starts. This amendment
+supersedes the original generation connection description above. Stable target
+IDs and tab selection apply to the worker's own tabs in the default mode.

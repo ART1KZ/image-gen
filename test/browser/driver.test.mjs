@@ -33,6 +33,12 @@ const fixture = `<!doctype html><title>ChatGPT test</title><main></main>
         ++window.stops; turn.querySelector('[data-talvt-turn-state]').dataset.talvtTurnState = 'complete';
         turn.querySelector('[data-testid=stop-button]').remove();
       };
+      if (window.delayResponseMs) {
+        const state = turn.querySelector('[data-talvt-turn-state]');
+        const stop = turn.querySelector('[data-testid=stop-button]');
+        state.removeAttribute('data-talvt-turn-state'); stop.remove();
+        setTimeout(() => { state.dataset.talvtTurnState = 'in_progress'; state.append(stop); }, window.delayResponseMs);
+      }
       document.querySelector('main').append(turn);
     });
   </script>`;
@@ -186,4 +192,61 @@ test("two page-bound pipelines overlap and save their own exact image bytes", as
     assert.equal(results[i].sha256, createHash("sha256").update(buffers[i]).digest("hex"));
   }
   assert.notEqual(results[0].sha256, results[1].sha256);
+});
+
+test("cancellation waits for a delayed owned response instead of treating a user-only turn as complete", async () => {
+  const tab = await driver.createTab({ name: "delayed-response" });
+  const page = await driver.findPage(tab.tab_id);
+  await page.evaluate(() => { window.delayResponseMs = 500; });
+  const controller = new AbortController();
+  const job = { job_id: "delayed-response", tab_id: tab.tab_id, prompt: "delayed response", artifact_path: path.join(scratch, "delay-response.png") };
+  let submitted;
+  const ready = new Promise(resolve => { submitted = resolve; });
+  const run = driver.run(job, { signal: controller.signal, onStage: stage => { if (stage === "submitted") submitted(); } });
+  const rejected = assert.rejects(run, /abort|cancel/i);
+  await ready; controller.abort();
+  let acknowledged = false;
+  const cancelling = driver.cancel(job).then(() => { acknowledged = true; });
+  await page.waitForTimeout(100);
+  assert.equal(acknowledged, false, "a user-only turn is not a completed response");
+  await cancelling; await rejected;
+  assert.equal(await page.evaluate(() => window.stops), 1);
+});
+
+test("an overlay actionability wait cannot send a prompt after abort", async () => {
+  const tab = await driver.createTab({ name: "overlay-send" });
+  const page = await driver.findPage(tab.tab_id);
+  await page.evaluate(() => {
+    const overlay = document.createElement('div');
+    overlay.id = 'test-overlay'; overlay.style = 'position:fixed;inset:0;z-index:999;background:white';
+    document.body.append(overlay);
+    setTimeout(() => overlay.remove(), 400);
+  });
+  const controller = new AbortController();
+  const sent = generation.submitPrompt(page, "must not send after abort", { signal: controller.signal });
+  setTimeout(() => controller.abort(), 60);
+  await assert.rejects(sent, /abort|cancel/i);
+  await page.waitForTimeout(500);
+  assert.equal(await page.evaluate(() => window.submissions), 0);
+});
+
+test("a replaced send button cannot revive a detached submission after cancellation", async () => {
+  const tab = await driver.createTab({ name: "replacement-send" });
+  const page = await driver.findPage(tab.tab_id);
+  const controller = new AbortController();
+  const sent = generation.submitPrompt(page, "never submit a replacement", {
+    signal: controller.signal,
+    onSubmitAttempt: () => {
+      void page.evaluate(() => {
+        const send = document.querySelector('button[type=submit]');
+        const replacement = send.cloneNode(true);
+        send.remove();
+        setTimeout(() => document.querySelector('form').append(replacement), 250);
+      });
+      setTimeout(() => controller.abort(), 50);
+    },
+  });
+  await assert.rejects(sent, /actionable|detach|cancel/i);
+  await page.waitForTimeout(400);
+  assert.equal(await page.evaluate(() => window.submissions), 0);
 });

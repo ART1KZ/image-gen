@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { chromium } from "playwright-core";
 import { PNG } from "pngjs";
-import { CDP_URL, ensureEdgeWithCdp, generateOnPage, inspectGeneration } from "./generate.mjs";
+import { CDP_URL, STORAGE_STATE_PATH, ensureEdgeWithCdp, generateOnPage, inspectGeneration } from "./generate.mjs";
 
 const STOP_SELECTOR = [
   'button[data-testid="stop-button"]:visible',
@@ -29,10 +29,16 @@ export async function isPageBusy(page) {
 
 /** One browser connection; each job retains an explicit stable target identity. */
 export class BrowserDriver {
-  constructor({ browser = null, context = null, cdpUrl = CDP_URL } = {}) {
+  constructor({ browser = null, context = null, cdpUrl = CDP_URL,
+    headless = !/^(0|false)$/i.test(process.env.IMAGE_GEN_HEADLESS || ""),
+    browserType = chromium, storagePath = STORAGE_STATE_PATH } = {}) {
     this.browser = browser;
     this.context = context;
     this.cdpUrl = cdpUrl;
+    this.headless = headless;
+    this.browserType = browserType;
+    this.storagePath = storagePath;
+    this.storageMtime = 0;
     this.ownsConnection = !browser;
     this.connecting = null;
     this.identities = new WeakMap();
@@ -41,13 +47,48 @@ export class BrowserDriver {
   }
 
   async connect() {
-    if (this.browser?.isConnected()) return;
+    if (this.connecting) { await this.connecting; return; }
+    if (this.browser?.isConnected()) {
+      if (this.ownsConnection && this.headless) await this.refreshSession();
+      return;
+    }
     if (!this.connecting) this.connecting = (async () => {
-      if (this.cdpUrl === CDP_URL) await ensureEdgeWithCdp();
-      this.browser = await chromium.connectOverCDP(this.cdpUrl, { timeout: 15_000 });
-      this.context = this.browser.contexts()[0] || await this.browser.newContext();
+      if (this.headless) {
+        let storageState;
+        try { storageState = JSON.parse(fs.readFileSync(this.storagePath, "utf8")); }
+        catch { throw new Error("Saved ChatGPT session is missing or invalid. Run image-gen login first."); }
+        if (!storageState.cookies?.some(cookie => /session-token/i.test(cookie.name))) {
+          throw new Error("Saved ChatGPT session has no login. Run image-gen login first.");
+        }
+        this.browser = await this.browserType.launch({ channel: "msedge", headless: true, chromiumSandbox: true });
+        try {
+          let userAgent = storageState.image_gen_user_agent;
+          if (!userAgent) {
+            const session = await this.browser.newBrowserCDPSession();
+            try { userAgent = (await session.send("Browser.getVersion")).userAgent.replace("HeadlessChrome/", "Chrome/"); }
+            finally { await session.detach(); }
+          }
+          this.context = await this.browser.newContext({ storageState: { cookies: storageState.cookies, origins: storageState.origins || [] }, userAgent });
+          this.storageMtime = fs.statSync(this.storagePath).mtimeMs;
+        } catch (error) { await this.browser.close(); this.browser = null; throw error; }
+      } else {
+        if (this.cdpUrl === CDP_URL) await ensureEdgeWithCdp();
+        this.browser = await this.browserType.connectOverCDP(this.cdpUrl, { timeout: 15_000 });
+        this.context = this.browser.contexts()[0] || await this.browser.newContext();
+      }
     })().finally(() => { this.connecting = null; });
     await this.connecting;
+  }
+
+  async refreshSession() {
+    // Login can refresh the backup while this daemon remains alive. Do not
+    // replace cookies underneath active generations or destroy existing tabs.
+    if ([...this.operations.values()].some(operation => !operation.settled)) return;
+    const stat = fs.statSync(this.storagePath, { throwIfNoEntry: false });
+    if (!stat || stat.mtimeMs === this.storageMtime) return;
+    const state = JSON.parse(fs.readFileSync(this.storagePath, "utf8"));
+    if (Array.isArray(state.cookies)) await this.context.addCookies(state.cookies);
+    this.storageMtime = stat.mtimeMs;
   }
 
   async targetId(page) {
@@ -156,7 +197,7 @@ export class BrowserDriver {
         if (page.isClosed()) return;
         if (!isChatGpt(page.url())) throw new Error("Cannot safely stop a job after its tab navigated away.");
         const state = await inspectGeneration(page, operation.generation);
-        if (state.found && state.complete) return;
+        if (state.found && state.complete && state.terminal_evidence) return;
         if (state.found && !state.is_latest) throw new Error("Another request now owns the tab; it was not stopped.");
         const stop = page.locator(STOP_SELECTOR).first();
         if (state.found && await stop.isVisible()) {

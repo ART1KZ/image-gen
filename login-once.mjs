@@ -70,6 +70,6 @@ await ensureChatGptLoggedIn(page, { waitForManual: true });
 await saveStorageState(page.context());
 
 console.log("\nSUCCESS — session saved.");
-console.log("You can close this terminal. Leave the auth-profile Edge open, or let the MCP relaunch it later.");
+console.log("You can close this terminal and the login window. Generation uses a separate headless Edge.");
 console.log("Do NOT delete the edge-auth-profile folder or chatgpt-storage.json.\n");
 process.exit(0);

@@ -19,10 +19,10 @@ Installing the image-gen MCP is not enough. Agents often ignore it and call a bu
 ## Hard rules
 
 1. **NEVER** call Cursor's built-in `GenerateImage` tool, or any other built-in image generator.
-2. **ALWAYS** call the image-gen MCP tool `generate_image`.
+2. **ALWAYS** use the image-gen MCP tools: `generate_image` for a synchronous result, or `start_generation` + `wait_job` for explicit jobs.
    - Cursor usually exposes the server as `user-image-gen` when `mcp.json` uses the key `image-gen`.
    - Claude Code and Claude Desktop usually expose it as `image-gen`.
-   - Discover the tool first, then call `generate_image` on that server.
+   - Discover the tools first, then call them on that server.
 3. If that MCP is unavailable, stop and tell the user. Do not fall back to a built-in image tool. Point them at the image-gen README: clone the repo, `npm install`, `npm run login`, register the MCP, and install this skill.
 
 ## Transparency / "black background" (do not loop)
@@ -53,14 +53,16 @@ After every `generate_image` call:
 
 ## Auth
 
-- Dedicated Edge (or Chrome) profile `edge-auth-profile` + attach-first on port 9222. This does not touch the daily browser.
+- Login opens the dedicated visible Edge auth profile on port 9222. Generation runs in a separate headless Edge by default; the login window can be closed after saving.
 - Auto-clicks **Welcome back / Choose an account**.
-- Restores and saves `chatgpt-storage.json`.
+- Restores and saves `chatgpt-storage.json`, including the login User-Agent.
 - If login is missing, tell the user to run `npm run login` once inside the image-gen repo (the folder that contains `mcp-server.mjs`).
 
 ## Prompting tips
 
-- One asset per call. Multiple assets means multiple `generate_image` calls. The MCP queues them.
-- Prefer awaiting one image before starting the next when possible — faster feedback if something fails.
+- One asset per job. Different tabs can generate simultaneously (default capacity two); the same tab runs jobs in order through one shared coordinator.
+- A generation uses a fresh managed tab by default. Use `list_tabs` / `create_tab` and an explicit `tab_id` for edits in the same conversation. Never guess a tab index.
+- For parallel work, use `start_generation` in separate tabs, preserve the returned job IDs, and inspect `get_job` / `wait_job`. Do not resubmit merely because a job is still running.
+- Use `cancel_job` to stop a job. A running cancellation is pending until acknowledged; never claim cancellation based only on `cancel_requested`.
 - Include subject, style, palette, composition, and intended UI use.
 - Save under the active project's static asset folder so paths work in the site.

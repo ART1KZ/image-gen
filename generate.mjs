@@ -173,6 +173,8 @@ export async function applyStorageState(context) {
 export async function saveStorageState(context) {
   try {
     const state = await context.storageState();
+    const page = context.pages().find(page => page.url().startsWith("https://chatgpt.com/"));
+    if (page) state.image_gen_user_agent = await page.evaluate(() => navigator.userAgent);
     fs.writeFileSync(STORAGE_STATE_PATH, JSON.stringify(state, null, 2));
     console.error(`[image-gen] Saved session → ${STORAGE_STATE_PATH}`);
   } catch (err) {
@@ -653,8 +655,19 @@ export async function submitPrompt(page, prompt, { signal, onSubmitAttempt = () 
     await sleep(100);
   }
   check();
+  await abortable(send.click({ trial: true, timeout: 20_000 }), signal);
+  const buttonHandle = await abortable(send.elementHandle({ timeout: 1000 }), signal);
+  check();
   onSubmitAttempt();
-  await send.click({ timeout: 1000 });
+  check();
+  try { await buttonHandle.evaluate(button => {
+    const rect = button.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    if (!button.isConnected || button.disabled || !rect.width || !rect.height || !hit || !button.contains(hit)) {
+      throw new Error("Send button is no longer actionable.");
+    }
+    button.click();
+  }); } finally { await buttonHandle.dispose(); }
 }
 
 function abortable(promise, signal) {
@@ -715,12 +728,13 @@ export async function inspectGeneration(page, generation = null) {
     }
     const states = roots.flatMap(root => [root, ...root.querySelectorAll("[data-talvt-turn-state]")])
       .filter(el => el.hasAttribute("data-talvt-turn-state"));
+    const terminal_evidence = states.length > 0 && states.every(el => el.getAttribute("data-talvt-turn-state") === "complete");
     const complete = roots.length > 0 && (states.length
       ? states.every(el => el.getAttribute("data-talvt-turn-state") === "complete")
-      : !document.querySelector('[data-testid="stop-button"]'));
+      : !target.hasAttribute("data-turn-key") && !document.querySelector('[data-testid="stop-button"]'));
     const is_latest = (roots.at(-1) || target) === turns.at(-1);
     const previousSources = new Set(generation.existingImageSrcs);
-    return { found: true, complete, is_latest, turn_key: key(target),
+    return { found: true, complete, terminal_evidence, is_latest, turn_key: key(target),
       image_srcs: complete ? sources(roots).filter(src => !previousSources.has(src)) : [] };
   }, { imageSelector: GENERATED_IMAGE_SELECTOR, turnSelector: TURN_SELECTOR, userSelector: USER_MESSAGE_SELECTOR, generation });
 }
