@@ -1,16 +1,22 @@
 {
   "name": "image-gen-mcp",
-  "version": "2.6.0",
+  "version": "3.0.0",
   "type": "module",
   "description": "MCP image generation for AI agents via your ChatGPT browser session — no OpenAI API key. Includes a /chatgpt-image-gen skill so the agent calls generate_image instead of a built-in image tool.",
   "main": "mcp-server.mjs",
   "bin": {
+    "image-gen": "cli.mjs",
     "image-gen-mcp": "mcp-server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "login": "node login-once.mjs",
     "test-connection": "node setup-session.mjs",
-    "start": "node mcp-server.mjs"
+    "start": "node mcp-server.mjs",
+    "test": "node --test test/unit/engine.test.mjs test/unit/coordinator.test.mjs test/unit/adapters.test.mjs test/unit/headless.test.mjs",
+    "test:browser": "node --test test/browser/driver.test.mjs test/composer.test.mjs test/generated-images.test.mjs test/queue.test.mjs test/result-ownership.test.mjs test/submission.test.mjs"
   },
   "keywords": [
     "mcp",
@@ -25,7 +31,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nothariharan/image-gen.git"
+    "url": "https://github.com/ART1KZ/image-gen.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
