@@ -15,7 +15,13 @@ export function runtimePaths(env = process.env) {
   if(!Number.isInteger(port)||port<1||port>65535)throw new Error('Invalid browser debugging port');
   const endpoint = `http://localhost:${port}`;
   const namespace = createHash('sha256').update(`${endpoint}\n${canonicalProfile}`).digest('hex').slice(0, 24);
-  const base = path.resolve(env.IMAGE_GEN_STATE_DIR || path.join(env.LOCALAPPDATA || path.join(os.homedir(), '.local', 'state'), 'image-gen'));
+  // Packaged/sanitized MCP clients can omit or redirect LOCALAPPDATA while
+  // connecting to the same pipe. Derive discovery from the user home instead;
+  // IMAGE_GEN_STATE_DIR remains the explicit override shared by all clients.
+  const localState = process.platform === 'win32'
+    ? path.join(os.homedir(), 'AppData', 'Local')
+    : path.join(os.homedir(), '.local', 'state');
+  const base = path.resolve(env.IMAGE_GEN_STATE_DIR || path.join(localState, 'image-gen'));
   const stateDir = path.join(base, namespace);
   return { namespace, stateDir, secretPath: path.join(stateDir, 'ipc-secret'), registryPath: path.join(stateDir, 'jobs.json'),
     socketPath: process.platform === 'win32' ? `\\\\.\\pipe\\image-gen-${namespace}` : path.join(stateDir, 'coordinator.sock') };

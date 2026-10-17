@@ -10,6 +10,18 @@ import { runtimePaths, readSecret, ensureRuntime } from '../../runtime-state.mjs
 import { request } from '../../coordinator-client.mjs';
 
 const root=fileURLToPath(new URL('../../',import.meta.url));
+test('Windows discovery uses the same directory when a client omits or redirects LOCALAPPDATA', {skip:process.platform!=='win32'}, ()=>{
+ const baseEnv={...process.env,IMAGE_GEN_STATE_DIR:undefined};
+ const standard=runtimePaths({...baseEnv,LOCALAPPDATA:path.join(os.homedir(),'AppData','Local')});
+ const omitted=runtimePaths({...baseEnv,LOCALAPPDATA:undefined});
+ const redirected=runtimePaths({...baseEnv,LOCALAPPDATA:path.join(os.homedir(),'AppData','Local','Packages','synthetic-client','LocalCache','Local')});
+ assert.equal(omitted.secretPath,standard.secretPath);
+ assert.equal(redirected.secretPath,standard.secretPath);
+ assert.equal(omitted.socketPath,standard.socketPath);
+ assert.equal(redirected.socketPath,standard.socketPath);
+ const explicit=runtimePaths({...baseEnv,IMAGE_GEN_STATE_DIR:path.join(os.tmpdir(),'explicit-image-gen-state'),LOCALAPPDATA:undefined});
+ assert.equal(explicit.stateDir,path.join(os.tmpdir(),'explicit-image-gen-state',standard.namespace));
+});
 async function context(t) {
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'image-ipc-')); const env={...process.env,IMAGE_GEN_STATE_DIR:dir,IMAGE_GEN_PROFILE_DIR:path.join(dir,'profile')}; const paths=runtimePaths(env); const children=[];
   t.after(async()=>{try{const daemon=await request('ping',{}, {env,autoStart:false,timeoutMs:1000});process.kill(daemon.pid);}catch{}for(const child of children)if(child.exitCode===null)child.kill(); await new Promise(r=>setTimeout(r,150));await fs.rm(dir,{recursive:true,force:true});});
