@@ -26,6 +26,8 @@ test('same-tab FIFO and cross-tab overlap respect global capacity',async t=>{
   const b=await engine.startGeneration({prompt:'three',tab_id:'b'});
   await until(()=>driver.starts.length===2);
   assert.deepEqual(driver.starts,[a.job_id,b.job_id]);
+  assert.equal((await engine.listTabs()).find(tab=>tab.tab_id==='a').active_job_id,a.job_id);
+  assert.equal(a.conversation_url,'https://chatgpt.com/');
   await driver.finish(a.job_id); await until(()=>driver.starts.length===3);
   assert.equal(driver.starts[2],a2.job_id);
   await driver.finish(b.job_id); await driver.finish(a2.job_id);

@@ -258,7 +258,7 @@ async function tryClickAccountPicker(page) {
  * Only waits on the user for real password/OAuth flows that need interaction.
  * Saves chatgpt-storage.json after a successful login.
  */
-export async function ensureChatGptLoggedIn(page, { waitForManual = true } = {}) {
+export async function ensureChatGptLoggedIn(page, { waitForManual = true, persistSession = true, restoreSession = true } = {}) {
   const context = page.context();
 
   try {
@@ -272,7 +272,7 @@ export async function ensureChatGptLoggedIn(page, { waitForManual = true } = {})
   }
 
   // Restore cookies from backup if this profile has no session yet.
-  if (!(await hasChatGptSession(page))) {
+  if (restoreSession && !(await hasChatGptSession(page))) {
     const applied = await applyStorageState(context);
     if (applied) {
       await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
@@ -284,7 +284,7 @@ export async function ensureChatGptLoggedIn(page, { waitForManual = true } = {})
   if ((await hasChatGptSession(page)) && (await promptReady(page))) {
     await tryClickAccountPicker(page);
     if (await promptReady(page)) {
-      await saveStorageState(context);
+      if (persistSession) await saveStorageState(context);
       return;
     }
   }
@@ -339,7 +339,7 @@ export async function ensureChatGptLoggedIn(page, { waitForManual = true } = {})
         .catch(() => false);
       if (ready) {
         console.error("[image-gen] ChatGPT login ready.");
-        await saveStorageState(context);
+        if (persistSession) await saveStorageState(context);
         return;
       }
     }
@@ -355,7 +355,7 @@ export async function ensureChatGptLoggedIn(page, { waitForManual = true } = {})
 }
 
 export async function generateOnPage(page, prompt, outputPath, {
-  transparent = false, referenceImages = [], signal, onStage = () => {},
+  transparent = false, referenceImages = [], signal, onStage = () => {}, validateTab = async () => {},
 } = {}) {
   const check = () => { if (signal?.aborted) throw new Error("Generation cancelled."); };
   check();
@@ -369,7 +369,8 @@ export async function generateOnPage(page, prompt, outputPath, {
   fs.mkdirSync(path.dirname(resolvedOutput), { recursive: true });
 
   onStage("preparing");
-  await ensureChatGptLoggedIn(page, { waitForManual: false });
+  await ensureChatGptLoggedIn(page, { waitForManual: false, persistSession: false, restoreSession: false });
+  await validateTab();
   check();
 
   /** @type {{url: string, buf: Buffer, at: number}[]} */
@@ -419,10 +420,12 @@ export async function generateOnPage(page, prompt, outputPath, {
 
     // Attach reference images BEFORE typing the prompt so ChatGPT sees them as context.
     if (referenceImages.length > 0) {
+      onStage("uploading");
       await uploadReferenceImages(page, referenceImages);
       check();
     }
 
+    await validateTab();
     const generation = await captureGenerationBaseline(page, finalPrompt);
     console.error(`[image-gen] Found ${generation.existingImageSrcs.length} pre-existing image(s) — matching only this prompt's new turn.`);
 
@@ -431,7 +434,7 @@ export async function generateOnPage(page, prompt, outputPath, {
 
     console.error("[image-gen] Sending prompt...");
     onStage("submitting", { generation });
-    await submitPrompt(page, finalPrompt, { signal, onSubmitAttempt: () => onStage("sending", { generation }) });
+    await submitPrompt(page, finalPrompt, { signal, conversationPath: generation.conversationPath, onSubmitAttempt: () => onStage("sending", { generation }) });
     // Always publish this acknowledgement before inspecting abort state.
     onStage("submitted", { generation });
     check();
@@ -636,7 +639,7 @@ const TURN_SELECTOR = '[data-turn-key], article[data-testid^="conversation-turn-
 const USER_MESSAGE_SELECTOR = '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]';
 
 /** Enter can leave a draft when the editor's send state has not caught up yet. */
-export async function submitPrompt(page, prompt, { signal, onSubmitAttempt = () => {} } = {}) {
+export async function submitPrompt(page, prompt, { signal, conversationPath, onSubmitAttempt = () => {} } = {}) {
   const check = () => { if (signal?.aborted) throw new Error("Generation cancelled."); };
   check();
   const composer = page.locator(COMPOSER_SELECTOR).first();
@@ -660,14 +663,16 @@ export async function submitPrompt(page, prompt, { signal, onSubmitAttempt = () 
   check();
   onSubmitAttempt();
   check();
-  try { await buttonHandle.evaluate(button => {
+  try { await buttonHandle.evaluate((button, expectedPath) => {
+    if (location.origin !== "https://chatgpt.com") throw new Error("Selected tab navigated away from ChatGPT before submission.");
+    if (expectedPath !== undefined && location.pathname !== expectedPath) throw new Error("Selected tab changed conversation before submission.");
     const rect = button.getBoundingClientRect();
     const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
     if (!button.isConnected || button.disabled || !rect.width || !rect.height || !hit || !button.contains(hit)) {
       throw new Error("Send button is no longer actionable.");
     }
     button.click();
-  }); } finally { await buttonHandle.dispose(); }
+  }, conversationPath); } finally { await buttonHandle.dispose(); }
 }
 
 function abortable(promise, signal) {

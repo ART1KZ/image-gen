@@ -44,6 +44,8 @@ export class BrowserDriver {
     this.identities = new WeakMap();
     this.managed = new Map();
     this.operations = new Map();
+    this.conversations = new Map();
+    this.dirtyTabs = new Set();
   }
 
   async connect() {
@@ -117,7 +119,7 @@ export class BrowserDriver {
   }
 
   async createTab({ name } = {}) {
-    if (name !== undefined && (typeof name !== "string" || !name.trim() || name.length > 120)) throw new Error("Tab name must be a non-empty string up to 120 characters.");
+    if (name !== undefined && (typeof name !== "string" || !name.trim() || name.length > 200)) throw new Error("Tab name must be a non-empty string up to 200 characters.");
     await this.connect();
     const page = await this.context.newPage();
     try {
@@ -145,6 +147,16 @@ export class BrowserDriver {
   async run(job, { signal, onStage = () => {} } = {}) {
     if (signal?.aborted) throw new Error("Generation cancelled.");
     const page = await this.findPage(job.tab_id);
+    if (this.dirtyTabs.has(job.tab_id)) throw new Error("Selected tab has unsubmitted reference attachments from an interrupted job. Create a new tab.");
+    const validateTab = async () => {
+      if (!isChatGpt(page.url())) throw new Error("Selected tab has navigated away from ChatGPT.");
+      if (job.conversation_url) {
+      const expected = new URL(job.conversation_url).pathname;
+      const current = new URL(page.url()).pathname;
+      const ownedTransition = expected === "/" && this.conversations.get(job.tab_id) === current;
+      if (expected !== current && !ownedTransition) throw new Error("Selected tab has changed conversation since the job was accepted.");
+    } };
+    await validateTab();
     if ([...this.operations.values()].some(operation => !operation.settled && operation.tabId === job.tab_id)) throw new Error("Selected tab already has a running job.");
     if (await isPageBusy(page)) throw new Error("Selected tab is busy with an existing generation.");
     if ([...this.operations.values()].some(operation => !operation.settled && operation.tabId === job.tab_id)) throw new Error("Selected tab already has a running job.");
@@ -157,18 +169,20 @@ export class BrowserDriver {
     try {
       const saved = await generateOnPage(page, job.prompt, job.artifact_path, {
         transparent: job.transparent_background ?? false,
-        referenceImages: job.reference_images || [], signal,
+        referenceImages: job.reference_images || [], signal, validateTab,
         onStage: (stage, details) => {
           operation.stage = stage;
+          if (stage === "uploading") this.dirtyTabs.add(job.tab_id);
           if (details?.generation) operation.generation = details.generation;
           if (stage === "sending") operation.attempted = true;
-          if (stage === "submitted") { operation.submitted = true; resolveSubmission(); }
+          if (stage === "submitted") { operation.submitted = true; this.dirtyTabs.delete(job.tab_id); resolveSubmission(); }
           onStage(stage);
         },
       });
       if (signal?.aborted) throw new Error("Generation cancelled.");
       const buffer = fs.readFileSync(saved);
       const png = PNG.sync.read(buffer);
+      this.conversations.set(job.tab_id, new URL(page.url()).pathname);
       return { artifact_path: saved, bytes: buffer.length, width: png.width, height: png.height,
         sha256: createHash("sha256").update(buffer).digest("hex") };
     } finally {
@@ -190,7 +204,11 @@ export class BrowserDriver {
       // A click already in flight must settle before deciding whether a response
       // exists. Otherwise cancellation could acknowledge before a late send.
       if (operation.stage === "submitting" || operation.stage === "sending") await operation.submissionSettled;
-      if ((!operation.submitted && !operation.attempted) || operation.page.isClosed()) return;
+      if (operation.page.isClosed()) return;
+      if (!operation.submitted && !operation.attempted) {
+        if (this.dirtyTabs.has(job.tab_id)) throw new Error("Reference upload was interrupted; composer cleanup cannot be confirmed. Create a new tab.");
+        return;
+      }
       const page = operation.page;
       const deadline = Date.now() + 12_000;
       while (Date.now() < deadline) {

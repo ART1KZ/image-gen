@@ -35,7 +35,7 @@ Two jobs in different tabs can run simultaneously by default. The same tab has a
 
 Use `--async` to get an ID immediately, repeated `--reference-image /absolute/path.png` for references, and `--transparent-background` for alpha. Output alternatives: `--output-dir`, `--filename`.
 
-Statuses: queued, running, succeeded, failed, cancelled. A running cancellation has `cancel_requested: true` until the browser confirms the owned response stopped. Failure to confirm produces an error. Interrupted jobs fail on coordinator restart and are never replayed automatically.
+Statuses: queued, running, succeeded, failed, cancelled. A running cancellation has `cancel_requested: true` until the browser confirms the owned response stopped. Failure to confirm produces an error. An interrupted reference upload blocks tab reuse because composer cleanup cannot be confirmed; create a new tab. Interrupted jobs fail on coordinator restart and are never replayed automatically.
 
 ## MCP
 

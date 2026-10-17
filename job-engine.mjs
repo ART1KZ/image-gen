@@ -35,7 +35,7 @@ export class JobEngine {
   }
   _exclusive(fn) { const run=this.chain.then(fn); this.chain=run.catch(()=>{}); return run; }
   _persist() { return atomicWrite(path.join(this.stateDir,'jobs.json'),JSON.stringify({version:1,jobs:[...this.jobs.values()],tabs:[...this.managedTabs.values()],blocked_tabs:[...this.blockedTabs]})); }
-  async listTabs() { return (await this.driver.listTabs()).map(tab=>({...tab,...this.managedTabs.get(tab.tab_id)})); }
+  async listTabs() { return (await this.driver.listTabs()).map(tab=>({...tab,...this.managedTabs.get(tab.tab_id),active_job_id:[...this.jobs.values()].find(job=>job.tab_id===tab.tab_id && job.status==='running')?.job_id || null})); }
   async createTab(params={}) {
     if(!params || typeof params!=='object' || Array.isArray(params) || Object.keys(params).some(k=>k!=='name')) throw new Error('Invalid tab options');
     if(params.name!==undefined) text(params.name,'name',200);
@@ -69,7 +69,7 @@ export class JobEngine {
       if(input.tab_id) { tab=(await this.driver.listTabs()).find(t=>t.tab_id===input.tab_id); if(!tab) throw new Error('Unknown tab_id'); }
       else {tab=await this.driver.createTab({});this.managedTabs.set(tab.tab_id,{tab_id:tab.tab_id,managed:true});}
       if(this.blockedTabs.has(tab.tab_id)) throw new Error('Tab has an unacknowledged cancellation');
-      const stamp=now(); const job={job_id:id,tab_id:tab.tab_id,prompt:input.prompt,status:'queued',output_path:output,output_key:key,
+      const stamp=now(); const job={job_id:id,tab_id:tab.tab_id,conversation_url:tab.url,prompt:input.prompt,status:'queued',output_path:output,output_key:key,
         artifact_path:path.join(this.stateDir,'artifacts',`${id}.png`),transparent_background:input.transparent_background || false,reference_images:references,
         created_at:stamp,updated_at:stamp,started_at:null,finished_at:null,cancel_requested:false,result:null,error:null};
       this.jobs.set(id,job);

@@ -250,3 +250,60 @@ test("a replaced send button cannot revive a detached submission after cancellat
   await page.waitForTimeout(400);
   assert.equal(await page.evaluate(() => window.submissions), 0);
 });
+
+test("queued jobs cannot silently change ChatGPT conversation within the same target", async () => {
+  const tab = await driver.createTab({ name: "conversation-binding" });
+  const page = await driver.findPage(tab.tab_id);
+  await page.goto("https://chatgpt.com/c/foreign");
+  await assert.rejects(driver.run({ job_id: "wrong-conversation", tab_id: tab.tab_id,
+    conversation_url: "https://chatgpt.com/c/selected", prompt: "do not send", artifact_path: path.join(scratch, "wrong.png") }), /changed conversation/);
+  assert.equal(await page.evaluate(() => window.submissions), 0);
+});
+
+test("navigation during reference preparation cannot retarget a submission", async () => {
+  const tab = await driver.createTab();
+  const page = await driver.findPage(tab.tab_id);
+  const reference = path.join(scratch, "navigation-reference.png");
+  fs.writeFileSync(reference, "synthetic-reference");
+  await page.goto("https://chatgpt.com/c/original");
+  await page.evaluate(() => {
+    const input = document.createElement('input'); input.type = 'file';
+    input.onchange = () => {
+      const img = document.createElement('img'); img.src = URL.createObjectURL(input.files[0]);
+      document.querySelector('form').append(img);
+      history.pushState({}, '', '/c/different');
+    };
+    document.querySelector('form').append(input);
+  });
+  await assert.rejects(driver.run({ job_id: "navigation-upload", tab_id: tab.tab_id,
+    conversation_url: "https://chatgpt.com/c/original", prompt: "for original", reference_images: [reference],
+    artifact_path: path.join(scratch, "navigation-result.png") }), /changed conversation/);
+  assert.equal(await page.evaluate(() => window.submissions), 0);
+});
+
+test("interrupted reference uploads cannot contaminate the next job on the tab", async () => {
+  const tab = await driver.createTab(); const page = await driver.findPage(tab.tab_id);
+  const reference = path.join(scratch, "cancelled-reference.png"); fs.writeFileSync(reference, "synthetic-reference");
+  await page.evaluate(() => {
+    const input = document.createElement('input'); input.type = 'file';
+    input.onchange = () => { const img = document.createElement('img'); img.src = URL.createObjectURL(input.files[0]); document.querySelector('form').append(img); };
+    document.querySelector('form').append(input);
+  });
+  const controller = new AbortController(); let uploading;
+  const began = new Promise(resolve => { uploading = resolve; });
+  const job = { job_id: "cancelled-upload", tab_id: tab.tab_id, prompt: "cancelled", reference_images: [reference], artifact_path: path.join(scratch, "cancelled-upload.png") };
+  const outcome = driver.run(job, { signal: controller.signal, onStage: stage => { if (stage === "uploading") uploading(); } }).catch(error => error);
+  await began; await page.waitForTimeout(100); controller.abort();
+  await assert.rejects(driver.cancel(job), /cleanup cannot be confirmed/);
+  assert.match((await outcome).message, /cancel/i);
+  await assert.rejects(driver.run({ ...job, job_id: "next-upload", reference_images: [] }), /unsubmitted reference attachments/);
+  assert.equal(await page.evaluate(() => window.submissions), 0);
+});
+
+test("generation preflight does not overwrite a login refreshed by another process", async () => {
+  const tab = await driver.createTab(); const page = await driver.findPage(tab.tab_id);
+  const marker = JSON.stringify({ refreshed_by_login: true });
+  fs.writeFileSync(process.env.IMAGE_GEN_STORAGE_STATE, marker);
+  await generation.ensureChatGptLoggedIn(page, { waitForManual: false, persistSession: false, restoreSession: false });
+  assert.equal(fs.readFileSync(process.env.IMAGE_GEN_STORAGE_STATE, "utf8"), marker);
+});

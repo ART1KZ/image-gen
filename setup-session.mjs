@@ -1,44 +1,16 @@
 /**
- * setup-session.mjs — verifies the auth-profile browser is reachable via CDP.
- *
- * Usage: node setup-session.mjs
+ * Verify the generation browser and saved login without spending an image.
  */
+import { BrowserDriver } from "./browser-driver.mjs";
+import { ensureChatGptLoggedIn } from "./generate.mjs";
 
-import { chromium } from "playwright-core";
-import {
-  AUTH_PROFILE_DIR,
-  STORAGE_STATE_PATH,
-  CDP_PORT,
-  CDP_URL,
-  cdpReady,
-  ensureEdgeWithCdp,
-} from "./generate.mjs";
-import fs from "fs";
-
-console.log(`Auth profile: ${AUTH_PROFILE_DIR}`);
-console.log(`Storage file: ${STORAGE_STATE_PATH} (${fs.existsSync(STORAGE_STATE_PATH) ? "present" : "missing — run login-once.mjs"})`);
-console.log(`Testing CDP on port ${CDP_PORT}...\n`);
-
-if (!(await cdpReady())) {
-  console.log("No browser on CDP — launching dedicated auth profile...");
-  try {
-    await ensureEdgeWithCdp();
-  } catch (err) {
-    console.error(`FAILED — ${err.message}\n`);
-    process.exit(1);
-  }
-}
-
-let browser;
+const driver = new BrowserDriver();
 try {
-  browser = await chromium.connectOverCDP(CDP_URL);
-} catch {
-  console.error(`FAILED — could not connect to ${CDP_URL}\n`);
-  process.exit(1);
-}
-
-const contexts = browser.contexts();
-console.log(`Connected! The browser has ${contexts.length} open context(s).`);
-console.log("If ChatGPT asks you to log in, run: node login-once.mjs");
-console.log("The image-gen MCP is ready to use.\n");
-process.exit(0);
+  const tab = await driver.createTab();
+  const page = await driver.findPage(tab.tab_id);
+  await ensureChatGptLoggedIn(page, { waitForManual: false, persistSession: false, restoreSession: false });
+  console.log(`Connected: ${driver.headless ? "headless" : "visible"} Edge; ChatGPT session ready.`);
+} catch (error) {
+  console.error(`Connection check failed: ${error.message}`);
+  process.exitCode = 1;
+} finally { await driver.close(); }
