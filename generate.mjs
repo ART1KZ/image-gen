@@ -4,14 +4,15 @@
  * Strategy (grounded in ChatGPT's actual 2026 DOM):
  *   The finished image renders as:
  *     <img alt="Generated image: ..." src="https://chatgpt.com/backend-api/estuary/content?id=file_...&sig=...">
- *   - alt^="Generated image"  -> stable SEMANTIC selector (not a fragile class)
+ *   - data-testid="generated-image-preview" -> independent of interface language
+ *   - alt^="Generated image" -> fallback for the older interface
  *   - src is a SIGNED url (the `sig` query param authorizes it), so it can be
  *     fetched directly from inside the page with no bearer-token handling.
  *
  *   PRIMARY: wait for that <img> to appear, wait until its src STOPS CHANGING
  *     (defeats the preview->final-resolution swap), then fetch the exact src.
- *   FALLBACK 1: image bytes captured at the network level (already authed).
- *   FALLBACK 2: newest large <img> on the page.
+ *   Only images belonging to the submitted prompt's new turn are eligible.
+ *   A timeout must fail instead of returning an image from an older request.
  *
  *   The /backend-api/conversation stream is parsed ONLY to detect an explicit
  *   refusal so we can fail fast. ChatGPT fires several conversation POSTs per
@@ -46,6 +47,13 @@ const SRC_STABLE_MS = 3_000;         // src must be unchanged this long = final
 const REFUSAL_MIN_WAIT_MS = 12_000;  // don't honor a refusal read too eagerly
 const CDP_LAUNCH_TIMEOUT_MS = 30_000;
 const LOGIN_WAIT_MS = 120_000;       // wait for user to finish ChatGPT login once
+
+// ChatGPT's current composer has no id; retain support for the older textarea.
+// Ignore hidden legacy fields when both versions exist in the DOM.
+const COMPOSER_SELECTOR =
+  '#prompt-textarea:visible, [contenteditable="true"][role="textbox"]:visible';
+const GENERATED_IMAGE_SELECTOR =
+  '[data-testid="generated-image-preview"] img, img[alt^="Generated image"]';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -179,7 +187,7 @@ async function hasChatGptSession(page) {
 
 async function promptReady(page) {
   try {
-    return (await page.locator("#prompt-textarea").count()) > 0;
+    return await page.locator(COMPOSER_SELECTOR).first().isVisible();
   } catch {
     return false;
   }
@@ -324,7 +332,7 @@ export async function ensureChatGptLoggedIn(page, { waitForManual = true } = {})
       }
       await tryClickAccountPicker(page);
       const ready = await page
-        .waitForSelector("#prompt-textarea", { state: "visible", timeout: 8_000 })
+        .waitForSelector(COMPOSER_SELECTOR, { state: "visible", timeout: 8_000 })
         .then(() => true)
         .catch(() => false);
       if (ready) {
@@ -433,53 +441,28 @@ async function generateImageUnlocked(prompt, outputPath, { transparent = false, 
     } else {
       console.error(`[image-gen] Reusing existing ChatGPT tab (${page.url()})...`);
     }
-    await page.waitForSelector("#prompt-textarea", { state: "visible", timeout: 20_000 });
+    await page.waitForSelector(COMPOSER_SELECTOR, { state: "visible", timeout: 20_000 });
     // Unblock composer if a prior job left ChatGPT's duplicate-upload dialog open.
     await dismissDuplicateUploadModal(page);
-
-    // Snapshot every generated-image src already in the DOM before we send the prompt.
-    // The detector will ignore these and only surface images that appear after this point.
-    const existingImageSrcs = new Set(await page.evaluate(() =>
-      [...document.querySelectorAll('img[alt^="Generated image"]')]
-        .map(el => el.currentSrc || el.src)
-        .filter(Boolean)
-    ));
-    console.error(`[image-gen] Found ${existingImageSrcs.size} pre-existing image(s) in thread — will ignore them.`);
 
     // Attach reference images BEFORE typing the prompt so ChatGPT sees them as context.
     if (referenceImages.length > 0) {
       await uploadReferenceImages(page, referenceImages);
     }
 
+    const generation = await captureGenerationBaseline(page, finalPrompt);
+    console.error(`[image-gen] Found ${generation.existingImageSrcs.length} pre-existing image(s) — matching only this prompt's new turn.`);
+
     promptSentAt = Date.now();
     listening = true;
 
     console.error("[image-gen] Sending prompt...");
-    await page.click("#prompt-textarea");
-    // Clear composer first — leftover text from a cancelled/parallel job causes garbage.
-    await page.evaluate(() => {
-      const el = document.querySelector("#prompt-textarea");
-      if (!el) return;
-      el.focus();
-      if (el.isContentEditable) {
-        el.innerHTML = "";
-        el.textContent = "";
-        el.dispatchEvent(new InputEvent("input", { bubbles: true }));
-      } else if ("value" in el) {
-        el.value = "";
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    });
-    // Atomic insert (not per-keystroke) so a lock slip can't interleave characters.
-    await page.keyboard.insertText(finalPrompt);
-    await page.keyboard.press("Enter");
+    await submitPrompt(page, finalPrompt);
 
     console.error("[image-gen] Waiting for generated image (up to 3 min)...");
     const deadline = Date.now() + HARD_TIMEOUT_MS;
 
-    // PRIMARY: wait for img[alt^="Generated image"] whose src has stabilized
-    // AND whose src was not present before we sent the prompt.
-    const stableSrc = await waitForStableGeneratedImage(page, deadline, existingImageSrcs, () => {
+    const stableSrc = await waitForStableGeneratedImage(page, deadline, generation, () => {
       if (refusal && Date.now() - promptSentAt > REFUSAL_MIN_WAIT_MS) {
         throw new Error(`ChatGPT refused: ${refusal.trim()}`);
       }
@@ -494,40 +477,19 @@ async function generateImageUnlocked(prompt, outputPath, { transparent = false, 
         console.error(`[image-gen] Saved ${(buf.length / 1024).toFixed(0)} KB -> ${resolvedOutput}`);
         return resolvedOutput;
       }
-      // If direct fetch failed, try to match captured bytes by file id.
-      const fileId = (stableSrc.match(/id=(file[_-][A-Za-z0-9]+)/) || [])[1];
-      if (fileId) {
-        const match = images.find((i) => i.url.includes(fileId));
-        if (match) {
-          assertValidImage(match.buf);
-          fs.writeFileSync(resolvedOutput, match.buf);
-          console.error(`[image-gen] Saved (matched id) ${(match.buf.length/1024).toFixed(0)} KB -> ${resolvedOutput}`);
-          return resolvedOutput;
-        }
+      // Only an exact response URL from this turn may substitute for a failed fetch.
+      const match = images.find((i) => i.url === stableSrc);
+      if (match) {
+        assertValidImage(match.buf);
+        fs.writeFileSync(resolvedOutput, match.buf);
+        console.error(`[image-gen] Saved (exact response) ${(match.buf.length/1024).toFixed(0)} KB -> ${resolvedOutput}`);
+        return resolvedOutput;
       }
-    }
-
-    // FALLBACK 1: largest captured image after the prompt.
-    const fresh = images.filter((i) => i.at >= promptSentAt);
-    if (fresh.length) {
-      const best = fresh.reduce((a, b) => (b.buf.length > a.buf.length ? b : a));
-      assertValidImage(best.buf);
-      fs.writeFileSync(resolvedOutput, best.buf);
-      console.error(`[image-gen] Saved (captured) ${(best.buf.length/1024).toFixed(0)} KB -> ${resolvedOutput}`);
-      return resolvedOutput;
-    }
-
-    // FALLBACK 2: any newest large <img>.
-    const domBuf = await tryDomFallback(page);
-    if (domBuf) {
-      assertValidImage(domBuf);
-      fs.writeFileSync(resolvedOutput, domBuf);
-      console.error(`[image-gen] Saved (dom fallback) -> ${resolvedOutput}`);
-      return resolvedOutput;
+      throw new Error("The current request produced an image, but its exact file could not be downloaded. No older image was substituted.");
     }
 
     throw new Error(
-      refusal ? `ChatGPT refused: ${refusal.trim()}` : "Timed out: no image produced within 3 minutes."
+      refusal ? `ChatGPT refused: ${refusal.trim()}` : "Timed out: no completed image belonging to this request within 3 minutes. No older image was substituted."
     );
   } finally {
     page.off("response", onResponse);
@@ -668,34 +630,94 @@ async function uploadReferenceImages(page, imagePaths) {
   }
 }
 
+const TURN_SELECTOR = '[data-turn-key], article[data-testid^="conversation-turn-"]';
+const USER_MESSAGE_SELECTOR = '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]';
+
+/** Enter can leave a draft when the editor's send state has not caught up yet. */
+export async function submitPrompt(page, prompt) {
+  const composer = page.locator(COMPOSER_SELECTOR).first();
+  await composer.fill(prompt);
+  const form = composer.locator("xpath=ancestor::form[1]");
+  const root = await form.count() ? form : page;
+  await root.locator('button[data-testid="send-button"]:visible, button[type="submit"]:visible')
+    .first().click({ timeout: 20_000 });
+}
+
+/** Capture turn identities as well as URLs: old images can receive new blob URLs. */
+export async function captureGenerationBaseline(page, prompt) {
+  return page.evaluate(({ turnSelector, imageSelector, prompt }) => {
+    const turns = [...document.querySelectorAll(turnSelector)];
+    const existingTurnKeys = turns.map(el => el.getAttribute("data-turn-key") || el.getAttribute("data-testid"));
+    return {
+      prompt,
+      existingTurnKeys,
+      lastTurnKey: existingTurnKeys.at(-1) || null,
+      conversationPath: location.pathname,
+      existingImageSrcs: [...document.querySelectorAll(imageSelector)].map(el => el.currentSrc || el.src).filter(Boolean),
+    };
+  }, { turnSelector: TURN_SELECTOR, imageSelector: GENERATED_IMAGE_SELECTOR, prompt });
+}
+
+/** With a generation scope, accept only its new, completed response turn. */
+export async function getGeneratedImageSrcs(page, generation = null) {
+  return page.evaluate(({ imageSelector, turnSelector, userSelector, generation }) => {
+    const sources = roots => roots.flatMap(root => [...root.querySelectorAll(imageSelector)])
+      .filter(el => !el.closest(userSelector))
+      .map(el => el.currentSrc || el.src).filter(Boolean);
+    if (!generation) return sources([document]);
+    if (generation.conversationPath?.startsWith("/c/") && location.pathname !== generation.conversationPath) return [];
+
+    const turns = [...document.querySelectorAll(turnSelector)];
+    const key = el => el.getAttribute("data-turn-key") || el.getAttribute("data-testid");
+    const user = el => el.matches(userSelector) ? el : el.querySelector(userSelector);
+    const normalize = text => text.replace(/\s+/g, " ").trim();
+    const previousKeys = new Set(generation.existingTurnKeys);
+    const anchor = generation.lastTurnKey ? turns.findIndex(el => key(el) === generation.lastTurnKey) : -1;
+    if (generation.lastTurnKey && anchor < 0) return [];
+    const matches = turns.filter((el, index) => index > anchor && !previousKeys.has(key(el)) &&
+      user(el) && normalize(user(el).innerText) === normalize(generation.prompt));
+    // Ambiguous repeated/concurrent prompts must not be guessed at.
+    if (matches.length !== 1) return [];
+
+    const target = matches[0];
+    let roots;
+    if (target.hasAttribute("data-turn-key")) {
+      roots = [target];
+    } else {
+      // Older ChatGPT markup puts user and assistant messages in separate articles.
+      roots = [];
+      for (let i = turns.indexOf(target) + 1; i < turns.length && !user(turns[i]); i++) roots.push(turns[i]);
+    }
+    if (!roots.length || roots.some(root => [...root.querySelectorAll("[data-talvt-turn-state]")]
+      .some(el => el.getAttribute("data-talvt-turn-state") !== "complete"))) return [];
+    if (document.querySelector('[data-testid="stop-button"]')) return [];
+    const previousSources = new Set(generation.existingImageSrcs);
+    return sources(roots).filter(src => !previousSources.has(src));
+  }, { imageSelector: GENERATED_IMAGE_SELECTOR, turnSelector: TURN_SELECTOR, userSelector: USER_MESSAGE_SELECTOR, generation });
+}
+
 /**
- * Polls for a NEW <img alt="Generated image…"> (one whose src was not in
- * existingImageSrcs before the prompt was sent) and returns its src once it
+ * Polls only the submitted prompt's response and returns its image once it
  * has remained unchanged for SRC_STABLE_MS (defeats the preview→final swap).
  * Calls onTick each poll so callers can bail on refusal.
  */
-async function waitForStableGeneratedImage(page, deadline, existingImageSrcs, onTick) {
+export async function waitForStableGeneratedImage(page, deadline, generation, onTick) {
   let lastSrc = null;
   let stableSince = 0;
-  const existingArr = [...existingImageSrcs]; // serialisable for page.evaluate
 
   while (Date.now() < deadline) {
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(Math.max(0, Math.min(700, deadline - Date.now())));
+    if (Date.now() >= deadline) break;
     if (onTick) onTick();
 
-    const src = await page.evaluate((existingSrcs) => {
-      const imgs = [...document.querySelectorAll('img[alt^="Generated image"]')];
-      // Only consider images that weren't present before the prompt was sent.
-      const newImgs = imgs.filter(el => {
-        const s = el.currentSrc || el.src;
-        return s && !existingSrcs.includes(s);
-      });
-      if (!newImgs.length) return null;
-      const el = newImgs[newImgs.length - 1];
-      return el.currentSrc || el.src || null;
-    }, existingArr);
+    const newSrcs = await getGeneratedImageSrcs(page, generation);
+    const src = newSrcs.length ? newSrcs[newSrcs.length - 1] : null;
 
-    if (!src) continue;
+    if (!src) {
+      lastSrc = null;
+      stableSince = 0;
+      continue;
+    }
 
     if (src === lastSrc) {
       if (Date.now() - stableSince >= SRC_STABLE_MS) return src;
@@ -704,7 +726,7 @@ async function waitForStableGeneratedImage(page, deadline, existingImageSrcs, on
       stableSince = Date.now();
     }
   }
-  return lastSrc; // best effort if we hit the deadline mid-stability
+  return null; // An unstable preview or old image is never a successful result.
 }
 
 /** Fetch a URL from inside the page (signed estuary URLs are self-authorizing). */
@@ -725,18 +747,6 @@ async function fetchInPage(page, url) {
   } catch {
     return null;
   }
-}
-
-/** Grab the newest large <img> and fetch it from inside the page. */
-async function tryDomFallback(page) {
-  const src = await page.evaluate(() => {
-    const imgs = [...document.querySelectorAll("img")]
-      .filter((i) => i.naturalWidth >= 256 && i.naturalHeight >= 256);
-    return imgs.length ? imgs[imgs.length - 1].src : null;
-  });
-  if (!src) return null;
-  const buf = await fetchInPage(page, src);
-  return buf && buf.length >= MIN_IMAGE_BYTES ? buf : null;
 }
 
 /** Throw if the buffer is not a PNG/JPEG/WebP raster. */

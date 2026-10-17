@@ -174,7 +174,7 @@ ChatGPT is a **single shared browser tab**. If two `generate_image` jobs type at
 
 **v2.4+ serializes every job** with an in-process queue + cross-process `.generate.lock` file. Parallel MCP calls wait their turn instead of colliding. You may still call multiple times from the agent — they run one after another automatically.
 
-If a job crashes hard and leaves a stuck lock, delete `image-gen/.generate.lock` (or wait until it goes stale, ~6 minutes).
+Locks left by an exited process are recovered automatically. A live owner's lock is never expired just because a job is slow. If that process is stuck, cancel its job or restart its MCP connection; do not delete an active job's lock. A fresh lock with incomplete metadata is left alone while its owner initializes it.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -291,16 +291,14 @@ Or in Cursor `mcp.json`:
 Playwright attaches over CDP, finds/opens a `chatgpt.com` tab, types the prompt, and waits for:
 
 ```text
-img[alt^="Generated image"]
+[data-testid="generated-image-preview"] img
 ```
 
-Primary path waits until the `src` stops changing for ~3 seconds (preview → final swap), then fetches the signed Estuary URL from inside the page.
+Before submitting, the script records existing turn IDs and image sources. It matches the new turn containing the exact submitted prompt and accepts images only from that turn's completed response. The selector above works with localized interfaces; the older English `img[alt^="Generated image"]` markup is also supported.
 
-**Fallback chain**
+The source must remain stable for ~3 seconds before an in-page fetch. If that fetch fails, only a captured response with the exact same URL is eligible.
 
-1. Stable `img[alt^="Generated image"]` → in-page fetch  
-2. Largest `image/*` network response during generation (≥ 80 KB)  
-3. Newest large `<img>` in the DOM  
+There is no fallback to the largest downloaded image or the last image in the thread. A timeout, ambiguous turn, or failed download returns an error instead of substituting an older result.
 
 Conversation streams are parsed only to detect refusals early (3‑minute hard timeout otherwise).
 
@@ -313,7 +311,7 @@ Conversation streams are parsed only to detect refusals early (3‑minute hard t
 - Close the tab → next call starts a fresh conversation  
 - Want a specific thread → open that URL in the auth-profile browser first  
 
-Collision guard: snapshots existing generated-image `src`s before sending the prompt, then only accepts new ones.
+Collision guard: matches the submitted prompt's new turn, not just new image URLs. Reloading an old image with a new blob URL does not make it a valid result.
 
 ---
 

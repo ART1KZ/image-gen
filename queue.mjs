@@ -11,6 +11,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomUUID } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -20,6 +21,7 @@ export const LOCK_PATH =
 const LOCK_WAIT_MS = Number(process.env.IMAGE_GEN_LOCK_WAIT_MS || 12 * 60 * 1000);
 const LOCK_STALE_MS = Number(process.env.IMAGE_GEN_LOCK_STALE_MS || 6 * 60 * 1000);
 const POLL_MS = 350;
+let ownedLockToken = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -30,8 +32,9 @@ function pidAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // Permission denied still means the owner exists.
+    return err.code !== "ESRCH";
   }
 }
 
@@ -44,25 +47,19 @@ function readLockMeta() {
 }
 
 function tryRemoveStaleLock() {
-  const meta = readLockMeta();
-  if (!meta) {
-    try {
-      fs.unlinkSync(LOCK_PATH);
-    } catch {
-      /* ignore */
-    }
-    return;
-  }
-  const age = Date.now() - (meta.at || 0);
-  if (age > LOCK_STALE_MS || !pidAlive(meta.pid)) {
-    try {
-      fs.unlinkSync(LOCK_PATH);
-      console.error(
-        `[image-gen] Cleared stale queue lock (pid=${meta.pid}, age=${Math.round(age / 1000)}s)`,
-      );
-    } catch {
-      /* ignore */
-    }
+  try {
+    const before = fs.statSync(LOCK_PATH);
+    const meta = readLockMeta();
+    // Another process may have created the file and not written its JSON yet.
+    if (!meta && Date.now() - before.mtimeMs < LOCK_STALE_MS) return;
+    // A long login/generation does not give another process ownership.
+    if (meta && pidAlive(meta.pid)) return;
+    const current = fs.statSync(LOCK_PATH);
+    if (current.ino !== before.ino || current.mtimeMs !== before.mtimeMs || current.size !== before.size) return;
+    fs.unlinkSync(LOCK_PATH);
+    console.error("[image-gen] Cleared abandoned queue lock.");
+  } catch {
+    /* The owner may have released the lock in the meantime. */
   }
 }
 
@@ -74,11 +71,13 @@ export async function acquireGenerateLock() {
   while (Date.now() - started < LOCK_WAIT_MS) {
     try {
       const fd = fs.openSync(LOCK_PATH, "wx");
-      fs.writeFileSync(
-        fd,
-        JSON.stringify({ pid: process.pid, at: Date.now() }, null, 2),
-      );
-      fs.closeSync(fd);
+      const token = randomUUID();
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now(), token }, null, 2));
+      } finally {
+        fs.closeSync(fd);
+      }
+      ownedLockToken = token;
       if (loggedWait) {
         console.error(
           `[image-gen] Queue lock acquired after ${Math.round((Date.now() - started) / 1000)}s`,
@@ -100,19 +99,21 @@ export async function acquireGenerateLock() {
 
   throw new Error(
     `Timed out after ${Math.round(LOCK_WAIT_MS / 1000)}s waiting for the image-gen queue. ` +
-      `If nothing is generating, delete ${LOCK_PATH} and retry.`,
+      "Cancel or restart the owning MCP process if it is stuck; do not delete an active job's lock.",
   );
 }
 
 export function releaseGenerateLock() {
+  if (!ownedLockToken) return;
   try {
     const meta = readLockMeta();
-    // Only delete if we own it (or it's unreadable).
-    if (!meta || meta.pid === process.pid) {
+    if (meta?.pid === process.pid && meta.token === ownedLockToken) {
       fs.unlinkSync(LOCK_PATH);
     }
   } catch {
     /* ignore */
+  } finally {
+    ownedLockToken = null;
   }
 }
 
