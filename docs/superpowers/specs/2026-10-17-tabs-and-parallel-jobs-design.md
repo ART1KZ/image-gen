@@ -1,6 +1,7 @@
 # Tab selection and parallel image jobs
 
-Status: proposed design for user review; implementation has not started.
+Status: approved by the user on 2026-10-17. Implementation follows the shared
+CLI + MCP coordinator option.
 
 ## Goal and constraints
 
