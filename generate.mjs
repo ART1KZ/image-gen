@@ -25,7 +25,7 @@ import fs from "fs";
 import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
-import { withGenerateQueue } from "./queue.mjs";
+import { randomUUID } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -352,7 +352,11 @@ export async function ensureChatGptLoggedIn(page, { waitForManual = true } = {})
   );
 }
 
-async function generateImageUnlocked(prompt, outputPath, { transparent = false, referenceImages = [] } = {}) {
+export async function generateOnPage(page, prompt, outputPath, {
+  transparent = false, referenceImages = [], signal, onStage = () => {},
+} = {}) {
+  const check = () => { if (signal?.aborted) throw new Error("Generation cancelled."); };
+  check();
   const finalPrompt = transparent
     ? `${prompt}. Isolated cutout on a COMPLETELY TRANSPARENT background (alpha), ` +
       `no solid black/white/colored plate, no backdrop box, no vignette fill. ` +
@@ -362,38 +366,9 @@ async function generateImageUnlocked(prompt, outputPath, { transparent = false, 
   const resolvedOutput = path.resolve(outputPath);
   fs.mkdirSync(path.dirname(resolvedOutput), { recursive: true });
 
-  await ensureEdgeWithCdp();
-
-  let browser;
-  try {
-    browser = await chromium.connectOverCDP(CDP_URL);
-  } catch {
-    throw new Error(
-      `Cannot connect to Edge on port ${CDP_PORT} even after auto-launch.\n` +
-      `Run once: node ${path.join(__dirname, "login-once.mjs")}`,
-    );
-  }
-
-  // Reuse an existing open ChatGPT tab if one is available; otherwise open a new one.
-  let page = null;
-  let needsNavigation = false;
-  for (const ctx of browser.contexts()) {
-    for (const p of ctx.pages()) {
-      if (p.url().includes("chatgpt.com")) {
-        page = p;
-        break;
-      }
-    }
-    if (page) break;
-  }
-  if (!page) {
-    const contexts = browser.contexts();
-    const context = contexts.length ? contexts[0] : await browser.newContext();
-    page = await context.newPage();
-    needsNavigation = true;
-  }
-
-  await ensureChatGptLoggedIn(page);
+  onStage("preparing");
+  await ensureChatGptLoggedIn(page, { waitForManual: false });
+  check();
 
   /** @type {{url: string, buf: Buffer, at: number}[]} */
   const images = [];          // network-captured image bytes (fallback)
@@ -435,19 +410,15 @@ async function generateImageUnlocked(prompt, outputPath, { transparent = false, 
   page.on("response", onResponse);
 
   try {
-    if (needsNavigation) {
-      console.error("[image-gen] Opening ChatGPT...");
-      await page.goto("https://chatgpt.com", { waitUntil: "domcontentloaded", timeout: 30_000 });
-    } else {
-      console.error(`[image-gen] Reusing existing ChatGPT tab (${page.url()})...`);
-    }
     await page.waitForSelector(COMPOSER_SELECTOR, { state: "visible", timeout: 20_000 });
+    check();
     // Unblock composer if a prior job left ChatGPT's duplicate-upload dialog open.
     await dismissDuplicateUploadModal(page);
 
     // Attach reference images BEFORE typing the prompt so ChatGPT sees them as context.
     if (referenceImages.length > 0) {
       await uploadReferenceImages(page, referenceImages);
+      check();
     }
 
     const generation = await captureGenerationBaseline(page, finalPrompt);
@@ -457,23 +428,31 @@ async function generateImageUnlocked(prompt, outputPath, { transparent = false, 
     listening = true;
 
     console.error("[image-gen] Sending prompt...");
-    await submitPrompt(page, finalPrompt);
+    onStage("submitting", { generation });
+    await submitPrompt(page, finalPrompt, { signal, onSubmitAttempt: () => onStage("sending", { generation }) });
+    // Always publish this acknowledgement before inspecting abort state.
+    onStage("submitted", { generation });
+    check();
 
     console.error("[image-gen] Waiting for generated image (up to 3 min)...");
     const deadline = Date.now() + HARD_TIMEOUT_MS;
 
     const stableSrc = await waitForStableGeneratedImage(page, deadline, generation, () => {
+      check();
       if (refusal && Date.now() - promptSentAt > REFUSAL_MIN_WAIT_MS) {
         throw new Error(`ChatGPT refused: ${refusal.trim()}`);
       }
     });
 
     if (stableSrc) {
+      check();
+      onStage("downloading");
       console.error("[image-gen] Final image src settled. Fetching exact image...");
       const buf = await fetchInPage(page, stableSrc);
       if (buf && buf.length >= MIN_IMAGE_BYTES) {
         assertValidImage(buf);
-        fs.writeFileSync(resolvedOutput, buf);
+        check();
+        atomicWriteImage(resolvedOutput, buf);
         console.error(`[image-gen] Saved ${(buf.length / 1024).toFixed(0)} KB -> ${resolvedOutput}`);
         return resolvedOutput;
       }
@@ -481,7 +460,8 @@ async function generateImageUnlocked(prompt, outputPath, { transparent = false, 
       const match = images.find((i) => i.url === stableSrc);
       if (match) {
         assertValidImage(match.buf);
-        fs.writeFileSync(resolvedOutput, match.buf);
+        check();
+        atomicWriteImage(resolvedOutput, match.buf);
         console.error(`[image-gen] Saved (exact response) ${(match.buf.length/1024).toFixed(0)} KB -> ${resolvedOutput}`);
         return resolvedOutput;
       }
@@ -498,11 +478,31 @@ async function generateImageUnlocked(prompt, outputPath, { transparent = false, 
 }
 
 /**
- * Public entry — always queued. Parallel MCP calls wait their turn so they
- * never type into the same ChatGPT composer at once.
+ * Compatible programmatic entry. All callers share coordinator ownership.
  */
 export async function generateImage(prompt, outputPath, options = {}) {
-  return withGenerateQueue(() => generateImageUnlocked(prompt, outputPath, options));
+  const { request } = await import("./coordinator-client.mjs");
+  let job = await request("start_generation", {
+    prompt, output_path: path.resolve(outputPath),
+    tab_id: options.tab_id, new_tab: options.new_tab,
+    transparent_background: options.transparent ?? false,
+    reference_images: (options.referenceImages || []).map(file => path.resolve(file)),
+  });
+  while (job.status === "queued" || job.status === "running") {
+    job = await request("wait_job", { job_id: job.job_id, timeout_ms: 30_000 }, { timeoutMs: 35_000 });
+  }
+  if (job.status !== "succeeded") throw new Error(job.error?.message || job.error || `Generation ${job.status}.`);
+  return job.output_path;
+}
+
+function atomicWriteImage(destination, buffer) {
+  const temporary = `${destination}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, buffer, { flag: "wx", mode: 0o600 });
+    fs.renameSync(temporary, destination);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch { /* already renamed */ }
+  }
 }
 
 /** ChatGPT's "this file was already uploaded" / duplicate-file dialog. */
@@ -634,13 +634,37 @@ const TURN_SELECTOR = '[data-turn-key], article[data-testid^="conversation-turn-
 const USER_MESSAGE_SELECTOR = '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]';
 
 /** Enter can leave a draft when the editor's send state has not caught up yet. */
-export async function submitPrompt(page, prompt) {
+export async function submitPrompt(page, prompt, { signal, onSubmitAttempt = () => {} } = {}) {
+  const check = () => { if (signal?.aborted) throw new Error("Generation cancelled."); };
+  check();
   const composer = page.locator(COMPOSER_SELECTOR).first();
   await composer.fill(prompt);
+  check();
   const form = composer.locator("xpath=ancestor::form[1]");
   const root = await form.count() ? form : page;
-  await root.locator('button[data-testid="send-button"]:visible, button[type="submit"]:visible')
-    .first().click({ timeout: 20_000 });
+  const send = root.locator('button[data-testid="send-button"]:visible, button[type="submit"]:visible').first();
+  // Auto-waiting click() cannot be revoked after an abort. Wait read-only until
+  // ready, then check cancellation immediately before the actual click.
+  await abortable(send.waitFor({ state: "visible", timeout: 20_000 }), signal);
+  const deadline = Date.now() + 20_000;
+  while (!(await send.isEnabled())) {
+    check();
+    if (Date.now() >= deadline) throw new Error("Send button did not become ready.");
+    await sleep(100);
+  }
+  check();
+  onSubmitAttempt();
+  await send.click({ timeout: 1000 });
+}
+
+function abortable(promise, signal) {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new Error("Generation cancelled."));
+    if (signal.aborted) { promise.catch(() => {}); abort(); return; }
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
 }
 
 /** Capture turn identities as well as URLs: old images can receive new blob URLs. */
@@ -658,14 +682,15 @@ export async function captureGenerationBaseline(page, prompt) {
   }, { turnSelector: TURN_SELECTOR, imageSelector: GENERATED_IMAGE_SELECTOR, prompt });
 }
 
-/** With a generation scope, accept only its new, completed response turn. */
-export async function getGeneratedImageSrcs(page, generation = null) {
+/** Inspect only the submitted request, including unfinished state for cancellation. */
+export async function inspectGeneration(page, generation = null) {
   return page.evaluate(({ imageSelector, turnSelector, userSelector, generation }) => {
+    const missing = { found: false, complete: false, is_latest: false, image_srcs: [] };
     const sources = roots => roots.flatMap(root => [...root.querySelectorAll(imageSelector)])
       .filter(el => !el.closest(userSelector))
       .map(el => el.currentSrc || el.src).filter(Boolean);
-    if (!generation) return sources([document]);
-    if (generation.conversationPath?.startsWith("/c/") && location.pathname !== generation.conversationPath) return [];
+    if (!generation) return { found: true, complete: true, is_latest: true, image_srcs: sources([document]) };
+    if (generation.conversationPath?.startsWith("/c/") && location.pathname !== generation.conversationPath) return missing;
 
     const turns = [...document.querySelectorAll(turnSelector)];
     const key = el => el.getAttribute("data-turn-key") || el.getAttribute("data-testid");
@@ -673,11 +698,11 @@ export async function getGeneratedImageSrcs(page, generation = null) {
     const normalize = text => text.replace(/\s+/g, " ").trim();
     const previousKeys = new Set(generation.existingTurnKeys);
     const anchor = generation.lastTurnKey ? turns.findIndex(el => key(el) === generation.lastTurnKey) : -1;
-    if (generation.lastTurnKey && anchor < 0) return [];
+    if (generation.lastTurnKey && anchor < 0) return missing;
     const matches = turns.filter((el, index) => index > anchor && !previousKeys.has(key(el)) &&
       user(el) && normalize(user(el).innerText) === normalize(generation.prompt));
     // Ambiguous repeated/concurrent prompts must not be guessed at.
-    if (matches.length !== 1) return [];
+    if (matches.length !== 1) return missing;
 
     const target = matches[0];
     let roots;
@@ -688,12 +713,21 @@ export async function getGeneratedImageSrcs(page, generation = null) {
       roots = [];
       for (let i = turns.indexOf(target) + 1; i < turns.length && !user(turns[i]); i++) roots.push(turns[i]);
     }
-    if (!roots.length || roots.some(root => [...root.querySelectorAll("[data-talvt-turn-state]")]
-      .some(el => el.getAttribute("data-talvt-turn-state") !== "complete"))) return [];
-    if (document.querySelector('[data-testid="stop-button"]')) return [];
+    const states = roots.flatMap(root => [root, ...root.querySelectorAll("[data-talvt-turn-state]")])
+      .filter(el => el.hasAttribute("data-talvt-turn-state"));
+    const complete = roots.length > 0 && (states.length
+      ? states.every(el => el.getAttribute("data-talvt-turn-state") === "complete")
+      : !document.querySelector('[data-testid="stop-button"]'));
+    const is_latest = (roots.at(-1) || target) === turns.at(-1);
     const previousSources = new Set(generation.existingImageSrcs);
-    return sources(roots).filter(src => !previousSources.has(src));
+    return { found: true, complete, is_latest, turn_key: key(target),
+      image_srcs: complete ? sources(roots).filter(src => !previousSources.has(src)) : [] };
   }, { imageSelector: GENERATED_IMAGE_SELECTOR, turnSelector: TURN_SELECTOR, userSelector: USER_MESSAGE_SELECTOR, generation });
+}
+
+/** With a generation scope, accept only its new, completed response turn. */
+export async function getGeneratedImageSrcs(page, generation = null) {
+  return (await inspectGeneration(page, generation)).image_srcs;
 }
 
 /**
