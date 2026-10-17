@@ -78,7 +78,7 @@ Local IPC uses an authenticated Windows named pipe or Unix socket and a private 
 
 ## Image correctness and transparency
 
-Only the exact prompt's new completed response is eligible. The image URL must stabilize before download. Ambiguity or timeout fails instead of substituting an older result. Transparent requests return TRANSPARENCY_REPORT and a checkerboard .preview.png. A soft bottom shadow can be valid alpha: inspect the report instead of repeatedly regenerating.
+Only the exact prompt's new completed response is eligible. A unique request ID is appended as explicit non-visual metadata to the submitted ChatGPT message, then its response turn is pinned. This distinguishes repeated prompts even when a new chat changes URL before rendering. The metadata is excluded from the requested image, though any prompt addition can occasionally influence the model. The image URL must stabilize before download. Ambiguity or timeout fails instead of substituting an older result. Transparent requests return TRANSPARENCY_REPORT and a checkerboard .preview.png. A soft bottom shadow can be valid alpha: inspect the report instead of repeatedly regenerating.
 
 ## Verification and troubleshooting
 

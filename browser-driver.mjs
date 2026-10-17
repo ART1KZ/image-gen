@@ -169,7 +169,7 @@ export class BrowserDriver {
     try {
       const saved = await generateOnPage(page, job.prompt, job.artifact_path, {
         transparent: job.transparent_background ?? false,
-        referenceImages: job.reference_images || [], signal, validateTab,
+        referenceImages: job.reference_images || [], signal, validateTab, requestId: job.job_id,
         onStage: (stage, details) => {
           operation.stage = stage;
           if (stage === "uploading") this.dirtyTabs.add(job.tab_id);

@@ -14,6 +14,8 @@ after(async () => { await context?.close(); await browser?.close(); });
 test("submits through the enabled send button when Enter does not submit", async () => {
   const page = await context.newPage();
   try {
+    await page.route("https://chatgpt.com/**", route => route.fulfill({ contentType: "text/html", body: "<html></html>" }));
+    await page.goto("https://chatgpt.com/");
     await page.setContent(`<form>
       <div contenteditable="true" role="textbox">leftover draft</div>
       <button type="submit" aria-label="Отправить" disabled>Send</button>

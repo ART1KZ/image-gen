@@ -1,5 +1,5 @@
 /**
- * generate.mjs — robust ChatGPT image generation over an attached Edge (CDP).
+ * generate.mjs — page-bound ChatGPT image generation and visible login helpers.
  *
  * Strategy (grounded in ChatGPT's actual 2026 DOM):
  *   The finished image renders as:
@@ -355,15 +355,16 @@ export async function ensureChatGptLoggedIn(page, { waitForManual = true, persis
 }
 
 export async function generateOnPage(page, prompt, outputPath, {
-  transparent = false, referenceImages = [], signal, onStage = () => {}, validateTab = async () => {},
+  transparent = false, referenceImages = [], signal, onStage = () => {}, validateTab = async () => {}, requestId = randomUUID(),
 } = {}) {
   const check = () => { if (signal?.aborted) throw new Error("Generation cancelled."); };
   check();
-  const finalPrompt = transparent
+  const contentPrompt = transparent
     ? `${prompt}. Isolated cutout on a COMPLETELY TRANSPARENT background (alpha), ` +
       `no solid black/white/colored plate, no backdrop box, no vignette fill. ` +
       `A faint contact shadow on the subject is ok; do not fill the canvas behind it.`
     : prompt;
+  const finalPrompt = `${contentPrompt}\n\n[Request tracking ID: ${requestId}. Metadata only; do not include this ID or its metadata text in the image.]`;
 
   const resolvedOutput = path.resolve(outputPath);
   fs.mkdirSync(path.dirname(resolvedOutput), { recursive: true });
@@ -426,7 +427,7 @@ export async function generateOnPage(page, prompt, outputPath, {
     }
 
     await validateTab();
-    const generation = await captureGenerationBaseline(page, finalPrompt);
+    const generation = await captureGenerationBaseline(page, finalPrompt, { requestId });
     console.error(`[image-gen] Found ${generation.existingImageSrcs.length} pre-existing image(s) — matching only this prompt's new turn.`);
 
     promptSentAt = Date.now();
@@ -686,18 +687,40 @@ function abortable(promise, signal) {
 }
 
 /** Capture turn identities as well as URLs: old images can receive new blob URLs. */
-export async function captureGenerationBaseline(page, prompt) {
-  return page.evaluate(({ turnSelector, imageSelector, prompt }) => {
+export async function captureGenerationBaseline(page, prompt, { requestId = null } = {}) {
+  return page.evaluate(({ turnSelector, imageSelector, userSelector, prompt, scopeId, requestId }) => {
     const turns = [...document.querySelectorAll(turnSelector)];
     const existingTurnKeys = turns.map(el => el.getAttribute("data-turn-key") || el.getAttribute("data-testid"));
+    const normalize = text => text.replace(/\s+/g, " ").trim();
+    const scope = { turnKey: null, path: location.pathname, origin: location.origin, requestId, invalid: false };
+    const previous = new Set(existingTurnKeys);
+    const observer = new MutationObserver(() => {
+      if (scope.turnKey || scope.invalid) return;
+      if (location.origin !== scope.origin || (location.pathname !== scope.path && !requestId)) { scope.invalid = true; return; }
+      const candidates = [...document.querySelectorAll(turnSelector)].filter(el => {
+        const key = el.getAttribute("data-turn-key") || el.getAttribute("data-testid");
+        const user = el.matches(userSelector) ? el : el.querySelector(userSelector);
+        return !previous.has(key) && user && normalize(user.innerText) === normalize(prompt);
+      });
+      if (candidates.length > 1) scope.invalid = true;
+      else if (candidates.length === 1) {
+        scope.turnKey = candidates[0].getAttribute("data-turn-key") || candidates[0].getAttribute("data-testid");
+        scope.path = location.pathname;
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    const scopes = window.__imageGenOwnedScopes ||= new Map();
+    scopes.set(scopeId, { scope, observer });
+    while (scopes.size > 100) { const id = scopes.keys().next().value; scopes.get(id).observer.disconnect(); scopes.delete(id); }
     return {
+      scopeId,
       prompt,
       existingTurnKeys,
       lastTurnKey: existingTurnKeys.at(-1) || null,
       conversationPath: location.pathname,
       existingImageSrcs: [...document.querySelectorAll(imageSelector)].map(el => el.currentSrc || el.src).filter(Boolean),
     };
-  }, { turnSelector: TURN_SELECTOR, imageSelector: GENERATED_IMAGE_SELECTOR, prompt });
+  }, { turnSelector: TURN_SELECTOR, imageSelector: GENERATED_IMAGE_SELECTOR, userSelector: USER_MESSAGE_SELECTOR, prompt, scopeId: randomUUID(), requestId });
 }
 
 /** Inspect only the submitted request, including unfinished state for cancellation. */
@@ -708,21 +731,35 @@ export async function inspectGeneration(page, generation = null) {
       .filter(el => !el.closest(userSelector))
       .map(el => el.currentSrc || el.src).filter(Boolean);
     if (!generation) return { found: true, complete: true, is_latest: true, image_srcs: sources([document]) };
+    const ownership = generation.scopeId ? window.__imageGenOwnedScopes?.get(generation.scopeId)?.scope : null;
+    if (generation.scopeId && (!ownership || ownership.invalid)) throw new Error("Selected conversation changed before its owned response could be identified.");
     if (generation.conversationPath?.startsWith("/c/") && location.pathname !== generation.conversationPath) return missing;
 
     const turns = [...document.querySelectorAll(turnSelector)];
     const key = el => el.getAttribute("data-turn-key") || el.getAttribute("data-testid");
+    if (ownership && location.pathname !== ownership.path &&
+      (!ownership.turnKey || !turns.some(el => key(el) === ownership.turnKey))) {
+      if (ownership.requestId && !ownership.turnKey && ownership.path === "/" && location.pathname.startsWith("/c/")) return missing;
+      throw new Error("Selected conversation changed after submission; the owned response is no longer present.");
+    }
     const user = el => el.matches(userSelector) ? el : el.querySelector(userSelector);
     const normalize = text => text.replace(/\s+/g, " ").trim();
     const previousKeys = new Set(generation.existingTurnKeys);
     const anchor = generation.lastTurnKey ? turns.findIndex(el => key(el) === generation.lastTurnKey) : -1;
     if (generation.lastTurnKey && anchor < 0) return missing;
     const matches = turns.filter((el, index) => index > anchor && !previousKeys.has(key(el)) &&
+      (!generation.scopeId || (ownership.turnKey && key(el) === ownership.turnKey)) &&
       user(el) && normalize(user(el).innerText) === normalize(generation.prompt));
     // Ambiguous repeated/concurrent prompts must not be guessed at.
     if (matches.length !== 1) return missing;
 
     const target = matches[0];
+    if (ownership && location.pathname !== ownership.path) {
+      // The optimistic local conversation gets a server URL after submission.
+      // Retain the exact pinned turn through that transition.
+      if ((ownership.path !== "/" && !ownership.path.startsWith("/c/local-chatgpt")) || !location.pathname.startsWith("/c/")) return missing;
+      ownership.path = location.pathname;
+    }
     let roots;
     if (target.hasAttribute("data-turn-key")) {
       roots = [target];

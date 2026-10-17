@@ -27,7 +27,7 @@ const fixture = `<!doctype html><title>ChatGPT test</title><main></main>
       const turn = document.createElement('div');
       turn.dataset.turnKey = 'turn-' + (++window.submissions);
       turn.innerHTML = '<div data-talvt-turn-state="in_progress"><div data-chatgpt-search-unit-key="message:0:user"></div><button type="button" data-testid="stop-button" aria-label="Остановить">Stop</button></div>';
-      turn.querySelector('[data-chatgpt-search-unit-key]').textContent = editor.textContent;
+      turn.querySelector('[data-chatgpt-search-unit-key]').textContent = editor.innerText;
       editor.textContent = '';
       turn.querySelector('[data-testid=stop-button]').onclick = () => {
         ++window.stops; turn.querySelector('[data-talvt-turn-state]').dataset.talvtTurnState = 'complete';
@@ -306,4 +306,60 @@ test("generation preflight does not overwrite a login refreshed by another proce
   fs.writeFileSync(process.env.IMAGE_GEN_STORAGE_STATE, marker);
   await generation.ensureChatGptLoggedIn(page, { waitForManual: false, persistSession: false, restoreSession: false });
   assert.equal(fs.readFileSync(process.env.IMAGE_GEN_STORAGE_STATE, "utf8"), marker);
+});
+
+test("submission rejects another origin even when its conversation pathname matches", async () => {
+  const page = await context.newPage();
+  await page.route("https://unrelated.invalid/**", route => route.fulfill({ contentType: "text/html", body: fixture }));
+  await page.goto("https://unrelated.invalid/c/original");
+  await assert.rejects(generation.submitPrompt(page, "do not leak", { conversationPath: "/c/original" }), /away from ChatGPT/);
+  assert.equal(await page.evaluate(() => window.submissions), 0);
+  await page.close();
+});
+
+test("a new chat cannot return an old identical prompt after post-submission navigation", async () => {
+  const tab = await driver.createTab(); const page = await driver.findPage(tab.tab_id);
+  const prompt = "identical repeated prompt";
+  const scope = await generation.captureGenerationBaseline(page, prompt);
+  await generation.submitPrompt(page, prompt);
+  await page.evaluate(prompt => {
+    history.pushState({}, '', '/c/old-conversation');
+    document.querySelector('main').innerHTML = '<div data-turn-key="old-unrelated-turn"><div data-talvt-turn-state="complete"><div data-chatgpt-search-unit-key="m:user"></div><button data-testid="generated-image-preview"><img src="data:image/png;base64,old"></button></div></div>';
+    document.querySelector('[data-chatgpt-search-unit-key]').textContent = prompt;
+  }, prompt);
+  await assert.rejects(generation.getGeneratedImageSrcs(page, scope), /conversation changed/);
+});
+
+test("a fresh chat can bind its own turn to the created conversation URL", async () => {
+  const tab = await driver.createTab(); const page = await driver.findPage(tab.tab_id);
+  const scope = await generation.captureGenerationBaseline(page, "owned transition");
+  await generation.submitPrompt(page, "owned transition");
+  await page.evaluate(() => history.pushState({}, '', '/c/new-owned-conversation'));
+  const state = await generation.inspectGeneration(page, scope);
+  assert.equal(state.found, true);
+  assert.equal(state.turn_key, "turn-1");
+});
+
+test("unique request metadata permits routing before the new turn without matching an older identical prompt", async () => {
+  const tab = await driver.createTab(); const page = await driver.findPage(tab.tab_id);
+  const requestId = "unique-test-request";
+  const prompt = `Draw a mug\n\n[Request tracking ID: ${requestId}. Metadata only.]`;
+  const scope = await generation.captureGenerationBaseline(page, prompt, { requestId });
+  await page.evaluate(() => {
+    history.pushState({}, '', '/c/local-chatgpt:new');
+    document.querySelector('main').innerHTML = '<div data-turn-key="old"><div data-talvt-turn-state="complete"><div data-chatgpt-search-unit-key="old:user">Draw a mug</div><button data-testid="generated-image-preview"><img src="data:image/png;base64,old"></button></div></div>';
+  });
+  assert.deepEqual(await generation.getGeneratedImageSrcs(page, scope), []);
+  await page.evaluate(prompt => {
+    const turn = document.createElement('div'); turn.dataset.turnKey = 'owned-unique-turn';
+    turn.innerHTML = '<div data-talvt-turn-state="in_progress"><div data-chatgpt-search-unit-key="new:user"></div></div>';
+    turn.querySelector('[data-chatgpt-search-unit-key]').textContent = prompt;
+    document.querySelector('main').append(turn);
+  }, prompt);
+  const state = await generation.inspectGeneration(page, scope);
+  assert.equal(state.found, true);
+  assert.equal(state.turn_key, "owned-unique-turn");
+  assert.equal(state.complete, false);
+  await page.evaluate(() => history.pushState({}, '', '/c/canonical-server-conversation'));
+  assert.equal((await generation.inspectGeneration(page, scope)).turn_key, "owned-unique-turn");
 });
