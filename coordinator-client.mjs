@@ -33,7 +33,7 @@ export async function request(method,params={},options={}) {
     if(Array.isArray(params.reference_images))params.reference_images=params.reference_images.map(p=>typeof p==='string'?path.resolve(p):p);
   }
   const paths=runtimePaths(env);const socket=await connection(paths,env,timeoutMs,autoStart);
-  let secret;try{secret=await readSecret(paths);}catch(error){socket.destroy();const failure=new Error('Coordinator discovery credentials are unavailable. Use the same IMAGE_GEN_STATE_DIR as the running coordinator for this browser profile.');failure.cause=error;throw failure;}
+  let secret;try{secret=await readSecret(paths);}catch(error){socket.destroy();const failure=new Error(`Coordinator discovery credentials are unavailable (${error.code || error.message}) in ${paths.stateDir}. Use the same IMAGE_GEN_STATE_DIR outside Windows AppData as the running coordinator for this browser profile.`);failure.cause=error;throw failure;}
   const message=Buffer.from(JSON.stringify({secret,method,params})+'\n');
   if(message.length>1024*1024){socket.destroy();throw new Error('Message too large');}
   return new Promise((resolve,reject)=>{

@@ -19,6 +19,7 @@ test('Windows discovery uses the same directory when a client omits or redirects
  assert.equal(redirected.secretPath,standard.secretPath);
  assert.equal(omitted.socketPath,standard.socketPath);
  assert.equal(redirected.socketPath,standard.socketPath);
+ assert.equal(standard.stateDir,path.join(os.homedir(),'.image-gen',standard.namespace));
  const explicit=runtimePaths({...baseEnv,IMAGE_GEN_STATE_DIR:path.join(os.tmpdir(),'explicit-image-gen-state'),LOCALAPPDATA:undefined});
  assert.equal(explicit.stateDir,path.join(os.tmpdir(),'explicit-image-gen-state',standard.namespace));
 });

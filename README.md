@@ -69,7 +69,7 @@ For parallel assets, start jobs in separate tabs and wait for their IDs. To refi
 | IMAGE_GEN_PROFILE_DIR | checkout edge-auth-profile | Login profile and coordinator identity |
 | IMAGE_GEN_CDP_PORT | 9222 | Visible login/debug endpoint |
 | IMAGE_GEN_STORAGE_STATE | checkout chatgpt-storage.json | Saved session and login User-Agent |
-| IMAGE_GEN_STATE_DIR | user-local image-gen directory | State/artifacts base |
+| IMAGE_GEN_STATE_DIR | Windows: ~/.image-gen; Unix: ~/.local/state/image-gen | Shared state/artifacts base, outside Windows AppData virtualization |
 | IMAGE_GEN_CHATGPT_EMAIL | optional | Preferred account-picker email |
 
 The daemon starts lazily, detached with no terminal window. Browser mode and capacity apply at daemon startup, not per request. `--headed` is a debugging startup option. Share profile/state settings across clients; changing only the state directory does not create a new browser namespace.
